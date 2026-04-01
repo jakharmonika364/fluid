@@ -70,8 +70,13 @@ func SetDataOperationInTargetDataset(ctx cruntime.ReconcileRequestContext, opera
 			return err
 		}
 
+		if !dataset.CanStartDataOperation(operationTypeName, operation.GetParallelTaskNumber(), dataOpKey) {
+			return fmt.Errorf("the dataset %s has reached the maximum number of parallel %s operations (limit: %d), please wait", targetDataset.Name, operationTypeName, operation.GetParallelTaskNumber())
+		}
+
 		// set current data operation in the target dataset
 		datasetToUpdate := dataset.DeepCopy()
+
 		datasetToUpdate.SetDataOperationInProgress(operationTypeName, dataOpKey)
 		// different operation may set other fields
 		operation.SetTargetDatasetStatusInProgress(datasetToUpdate)

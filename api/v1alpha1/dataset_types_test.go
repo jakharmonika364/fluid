@@ -185,3 +185,107 @@ func TestDataset_SetDataOperationInProgress(t *testing.T) {
 		})
 	}
 }
+
+func TestDataset_CanStartDataOperation(t *testing.T) {
+	type fields struct {
+		Status DatasetStatus
+	}
+	type args struct {
+		operationType string
+		maxParallel   int32
+		name          string
+	}
+	tests := []struct {
+		name   string
+		fields fields
+		args   args
+		want   bool
+	}{
+		{
+			name: "empty_status",
+			fields: fields{
+				Status: DatasetStatus{},
+			},
+			args: args{
+				operationType: "DataLoad",
+				maxParallel:   1,
+				name:          "load-1",
+			},
+			want: true,
+		},
+		{
+			name: "already_in_progress_reentrant",
+			fields: fields{
+				Status: DatasetStatus{
+					OperationRef: map[string]string{
+						"DataLoad": "load-1",
+					},
+				},
+			},
+			args: args{
+				operationType: "DataLoad",
+				maxParallel:   1,
+				name:          "load-1",
+			},
+			want: true,
+		},
+		{
+			name: "blocked_by_max_parallel_1",
+			fields: fields{
+				Status: DatasetStatus{
+					OperationRef: map[string]string{
+						"DataLoad": "load-1",
+					},
+				},
+			},
+			args: args{
+				operationType: "DataLoad",
+				maxParallel:   1,
+				name:          "load-2",
+			},
+			want: false,
+		},
+		{
+			name: "allowed_by_max_parallel_2",
+			fields: fields{
+				Status: DatasetStatus{
+					OperationRef: map[string]string{
+						"DataLoad": "load-1",
+					},
+				},
+			},
+			args: args{
+				operationType: "DataLoad",
+				maxParallel:   2,
+				name:          "load-2",
+			},
+			want: true,
+		},
+		{
+			name: "blocked_by_max_parallel_2",
+			fields: fields{
+				Status: DatasetStatus{
+					OperationRef: map[string]string{
+						"DataLoad": "load-1,load-2",
+					},
+				},
+			},
+			args: args{
+				operationType: "DataLoad",
+				maxParallel:   2,
+				name:          "load-3",
+			},
+			want: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dataset := &Dataset{
+				Status: tt.fields.Status,
+			}
+			if got := dataset.CanStartDataOperation(tt.args.operationType, tt.args.maxParallel, tt.args.name); got != tt.want {
+				t.Errorf("CanStartDataOperation() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
