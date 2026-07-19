@@ -197,6 +197,23 @@ func (e *AlluxioEngine) SyncReplicas(ctx cruntime.ReconcileRequestContext) (err 
 					return updateErr
 				}
 			}
+		} else if _, tracked := getDecommissionStart(runtime); tracked {
+			// A decommission attempt was tracked but we're no longer in an
+			// active graceful scale-down this reconcile - scaled to zero,
+			// scaled back up past it before the drain finished, or the
+			// feature gate was disabled mid-flight. The condition above only
+			// clears on a clean drain-to-completion inside the block, so
+			// leaving via any of these other exits would otherwise strand it
+			// at Status=True. A future, unrelated scale-down would then read
+			// its stale LastTransitionTime as its own decommissionStart,
+			// making the drain look like it's already run out the deadline
+			// on its very first reconcile and skip straight to forcing scale-
+			// down through - silently dropping the graceful guarantee for
+			// that scale-down.
+			runtimeToUpdate.Status.Conditions = clearDecommissioningCondition(runtimeToUpdate.Status.Conditions)
+			if updateErr := e.Client.Status().Update(ctx, runtimeToUpdate); updateErr != nil {
+				return updateErr
+			}
 		}
 
 		err = e.Helper.SyncReplicas(ctx, runtimeToUpdate, runtimeToUpdate.Status, workers)

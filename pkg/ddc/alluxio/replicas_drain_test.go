@@ -498,6 +498,104 @@ var _ = Describe("AlluxioEngine SyncReplicas worker decommission deadline", Labe
 				types.NamespacedName{Name: deadlineTestRuntime + "-worker", Namespace: deadlineTestNs}, &updatedSts)).To(Succeed())
 			Expect(*updatedSts.Spec.Replicas).To(Equal(int32(0)))
 		})
+
+		It("clears a lingering condition from an earlier scale-in that a scale-to-zero cut short, so a later scale-down starts fresh", func() {
+			// Regression test for the exact sequence cheyang traced: 3 -> 1
+			// tracks a decommission condition (Status=True); before that
+			// drain finishes, the user scales straight to 0. The block above
+			// is skipped entirely (Replicas()==0), so without this clearing
+			// step the condition would be stranded at Status=True forever.
+			// A later, unrelated scale-down would then read its stale
+			// LastTransitionTime as its own decommissionStart and find
+			// itself already past defaultWorkerDecommissionDeadline on its
+			// very first reconcile - forcing scale-down through immediately
+			// instead of attempting a graceful drain at all.
+			staleCond := utils.NewRuntimeCondition(v1alpha1.RuntimeWorkerDecommissioning,
+				v1alpha1.RuntimeWorkerDecommissioningReason, "abandoned 3 -> 1 attempt", corev1.ConditionTrue)
+			staleCond.LastTransitionTime = metav1.NewTime(time.Now().Add(-defaultWorkerDecommissionDeadline - time.Hour))
+
+			rt := &v1alpha1.AlluxioRuntime{
+				ObjectMeta: metav1.ObjectMeta{Name: deadlineTestRuntime, Namespace: deadlineTestNs},
+				Spec:       v1alpha1.AlluxioRuntimeSpec{Replicas: 0},
+				Status: v1alpha1.RuntimeStatus{
+					DesiredWorkerNumberScheduled: 1,
+					Conditions:                   []v1alpha1.RuntimeCondition{staleCond},
+				},
+			}
+			sts := &appsv1.StatefulSet{
+				ObjectMeta: metav1.ObjectMeta{Name: deadlineTestRuntime + "-worker", Namespace: deadlineTestNs},
+				Spec:       appsv1.StatefulSetSpec{Replicas: ptr.To[int32](1)},
+				Status:     appsv1.StatefulSetStatus{Replicas: 1},
+			}
+			dataset := &v1alpha1.Dataset{
+				ObjectMeta: metav1.ObjectMeta{Name: deadlineTestRuntime, Namespace: deadlineTestNs},
+			}
+			fakeClient := fake.NewFakeClientWithScheme(testScheme, rt, sts, dataset)
+			engine := newAlluxioEngineREP(fakeClient, deadlineTestRuntime, deadlineTestNs)
+
+			// Step 1: reconcile the scale-to-zero. This must clear the
+			// stranded condition rather than just skip past it.
+			err := engine.SyncReplicas(cruntime.ReconcileRequestContext{
+				Log: fake.NullLogger(), Recorder: record.NewFakeRecorder(300),
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			clearedCond := getCondition(engine)
+			Expect(clearedCond).NotTo(BeNil())
+			Expect(clearedCond.Status).To(Equal(corev1.ConditionFalse))
+
+			// Step 2: time passes; the runtime is scaled back up, then a
+			// genuine new scale-down (3 -> 1) is requested. If the earlier
+			// condition had leaked through, this reconcile would immediately
+			// force scale-down to proceed (it'd compute elapsed against the
+			// ancient stale timestamp, already past the deadline) instead of
+			// starting a real graceful drain.
+			var currentSts appsv1.StatefulSet
+			Expect(engine.Client.Get(context.TODO(),
+				types.NamespacedName{Name: deadlineTestRuntime + "-worker", Namespace: deadlineTestNs}, &currentSts)).To(Succeed())
+			currentSts.Spec.Replicas = ptr.To[int32](3)
+			Expect(engine.Client.Update(context.TODO(), &currentSts)).To(Succeed())
+			// Spec and Status are separate subresources on this fake client
+			// (see fake.NewFakeClientWithScheme's WithStatusSubresource) - a
+			// plain Update only persists the Spec change above.
+			currentSts.Status.Replicas = 3
+			Expect(engine.Client.Status().Update(context.TODO(), &currentSts)).To(Succeed())
+
+			for _, ord := range []int{0, 1, 2} {
+				pod := &corev1.Pod{
+					ObjectMeta: metav1.ObjectMeta{Name: fmt.Sprintf("%s-worker-%d", deadlineTestRuntime, ord), Namespace: deadlineTestNs},
+					Status:     corev1.PodStatus{HostIP: fmt.Sprintf("10.0.0.%d", ord+10), Phase: corev1.PodRunning},
+				}
+				Expect(engine.Client.Create(context.TODO(), pod)).To(Succeed())
+			}
+
+			var newRt v1alpha1.AlluxioRuntime
+			Expect(engine.Client.Get(context.TODO(),
+				types.NamespacedName{Name: deadlineTestRuntime, Namespace: deadlineTestNs}, &newRt)).To(Succeed())
+			newRt.Spec.Replicas = 1
+			Expect(engine.Client.Update(context.TODO(), &newRt)).To(Succeed())
+
+			patch1 := gomonkey.ApplyFunc(operations.AlluxioFileUtils.DecommissionWorkers,
+				func(_ operations.AlluxioFileUtils, _ []string) error { return nil })
+			defer patch1.Reset()
+			patch2 := gomonkey.ApplyFunc(operations.AlluxioFileUtils.CountActiveWorkers,
+				func(_ operations.AlluxioFileUtils) (int, error) { return 3, nil })
+			defer patch2.Reset()
+
+			err = engine.SyncReplicas(cruntime.ReconcileRequestContext{
+				Log: fake.NullLogger(), Recorder: record.NewFakeRecorder(300),
+			})
+			// A fresh attempt that hasn't finished within one reconcile
+			// reports errWorkersNotYetDrained and keeps requeuing - not a
+			// forced-through proceed, which is what a leaked stale
+			// decommissionStart would have produced instead.
+			Expect(errors.Is(err, errWorkersNotYetDrained)).To(BeTrue())
+
+			freshCond := getCondition(engine)
+			Expect(freshCond).NotTo(BeNil())
+			Expect(freshCond.Status).To(Equal(corev1.ConditionTrue))
+			Expect(time.Since(freshCond.LastTransitionTime.Time)).To(BeNumerically("<", time.Minute))
+		})
 	})
 
 	Context("when a new attempt targets the exact same addresses as a previously cleared one", func() {
