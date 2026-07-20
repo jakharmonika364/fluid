@@ -65,6 +65,20 @@ function setup_minio() {
     wait_job_completed "$bucket_create_job_name"
 }
 
+# Tears minio down entirely so the post-scale-down read can only be served by
+# data still cached on an Alluxio worker, never by a transparent UFS
+# re-fetch: fixture.txt lives in the S3 UFS the whole test long, so with minio
+# still up, read_after_job's "cat" would succeed identically whether or not
+# graceful decommission actually preserved any cached block - it proves
+# nothing about the drain. Called between the two read jobs so read_before
+# (which primes the cache via Alluxio's default CACHE_PROMOTE read type) can
+# still reach minio, but read_after cannot.
+function teardown_minio() {
+    kubectl delete --ignore-not-found -f test/gha-e2e/alluxio-scaledown/minio.yaml
+    kubectl wait --for=delete pod -l app=scaledown-minio --timeout=60s 2>/dev/null || true
+    syslog "Tore down scaledown-minio; the post-scale-down read can now only be served by data still cached in Alluxio workers"
+}
+
 function create_dataset() {
     kubectl create -f test/gha-e2e/alluxio-scaledown/dataset.yaml
 
@@ -225,6 +239,7 @@ function main() {
     wait_worker_replicas 2
     create_job test/gha-e2e/alluxio-scaledown/read_before_job.yaml $read_before_job_name
     wait_job_completed $read_before_job_name
+    teardown_minio
     scale_down
     wait_worker_replicas 1
     create_job test/gha-e2e/alluxio-scaledown/read_after_job.yaml $read_after_job_name
