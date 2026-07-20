@@ -59,11 +59,19 @@ const (
 	defaultGracefulShutdownLimits       int32 = 3
 	defaultCleanCacheGracePeriodSeconds int32 = 60
 
-	// defaultWorkerWebPort is the Alluxio worker web port used when the
-	// runtime spec does not override alluxio.worker.web.port. decommissionWorker
-	// addresses this port, not the RPC port, since it monitors the worker's
-	// workload as exposed on the web server.
+	// defaultWorkerWebPort is the fallback Alluxio worker web port used only
+	// when a worker pod's own container spec doesn't expose one (see
+	// workerWebPortFromPod). decommissionWorker addresses this port, not the
+	// RPC port, since it monitors the worker's workload as exposed on the web
+	// server.
 	defaultWorkerWebPort = 30000
+
+	// alluxioWorkerContainerName is the name charts/alluxio gives the
+	// Alluxio worker container, see
+	// charts/alluxio/templates/worker/statefulset.yaml. Used to pick the
+	// worker's own "web" container port apart from the alluxio-job-worker
+	// container, which exposes a differently-numbered port of the same name.
+	alluxioWorkerContainerName = "alluxio-worker"
 
 	MountConfigStorage   = "ALLUXIO_MOUNT_CONFIG_STORAGE"
 	ConfigmapStorageName = "configmap"

@@ -297,9 +297,13 @@ func (e *AlluxioEngine) drainScalingDownWorkers(ctx context.Context, runtime *da
 // the web server. The worker registers with the master under its node's IP
 // (see the ALLUXIO_WORKER_HOSTNAME wiring in charts/alluxio, which sources
 // alluxio.worker.hostname from status.hostIP), not its pod IP, so that is
-// the identity it must be addressed by.
+// the identity it must be addressed by. The port is read from each pod's own
+// container spec (see workerWebPortFromPod) rather than assumed from
+// runtime.Spec.Worker.Ports: in host network mode (the default, see
+// data.IsHostNetwork) the operator allocates the worker web port dynamically
+// whenever spec.worker.ports.web isn't pinned, and that allocated port is
+// never written back to the runtime spec.
 func (e *AlluxioEngine) getDecommissionAddresses(ctx context.Context, runtime *data.AlluxioRuntime, desiredReplicas, currentReplicas int32) ([]string, error) {
-	workerWebPort := e.getWorkerWebPort(runtime)
 	workerStsName := e.getWorkerName()
 
 	// Pods sharing a node produce the same HostIP; seen tracks addresses
@@ -341,6 +345,12 @@ func (e *AlluxioEngine) getDecommissionAddresses(ctx context.Context, runtime *d
 				"pod", podName, "phase", pod.Status.Phase)
 			continue
 		}
+		workerWebPort, ok := workerWebPortFromPod(pod)
+		if !ok {
+			workerWebPort = e.getWorkerWebPort(runtime)
+			e.Log.Info("Worker pod has no \"web\" container port, falling back to the configured/default port",
+				"pod", podName, "port", workerWebPort)
+		}
 		hostIP := pod.Status.HostIP
 		if strings.Contains(hostIP, ":") {
 			// IPv6; needs bracketing in a host:port pair.
@@ -356,13 +366,43 @@ func (e *AlluxioEngine) getDecommissionAddresses(ctx context.Context, runtime *d
 	return toDecommission, nil
 }
 
-// getWorkerWebPort returns the configured Alluxio worker web port, falling
-// back to the Alluxio default when the runtime does not override it.
+// getWorkerWebPort returns the runtime-spec-configured Alluxio worker web
+// port, falling back to the Alluxio default when the runtime does not
+// override it. This is only a fallback for getDecommissionAddresses, used
+// when a worker pod's own container spec doesn't expose a "web" port:
+// spec.worker.ports.web reflects the actual bound port only when the user
+// pinned it, since in host network mode (the default) an unpinned port is
+// allocated dynamically and never written back to the spec - see
+// workerWebPortFromPod, which reads the port the worker container actually
+// binds.
 func (e *AlluxioEngine) getWorkerWebPort(runtime *data.AlluxioRuntime) int {
 	if port, ok := runtime.Spec.Worker.Ports["web"]; ok && port > 0 {
 		return port
 	}
 	return defaultWorkerWebPort
+}
+
+// workerWebPortFromPod returns the web port actually bound by the given
+// worker pod's alluxio-worker container, and whether one was found. This is
+// the source of truth for the port decommissionWorker must address: unlike
+// runtime.Spec.Worker.Ports, it reflects the port in effect regardless of
+// network mode or whether it was pinned or dynamically allocated (see
+// getDecommissionAddresses). Matching must be scoped to the alluxio-worker
+// container specifically - alluxio-job-worker also exposes a differently
+// numbered port of the same name "web" (see
+// charts/alluxio/templates/worker/statefulset.yaml).
+func workerWebPortFromPod(pod *corev1.Pod) (int, bool) {
+	for _, container := range pod.Spec.Containers {
+		if container.Name != alluxioWorkerContainerName {
+			continue
+		}
+		for _, port := range container.Ports {
+			if port.Name == "web" {
+				return int(port.ContainerPort), true
+			}
+		}
+	}
+	return 0, false
 }
 
 // getDecommissionStart returns when the current worker-drain attempt began,

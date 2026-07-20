@@ -89,6 +89,23 @@ var _ = Describe("AlluxioEngine drainScalingDownWorkers", Label("pkg.ddc.alluxio
 		}
 	}
 
+	// workerPodWithWebPort mirrors what charts/alluxio/templates/worker/
+	// statefulset.yaml actually renders onto the alluxio-worker container -
+	// used to prove the decommission address is read from the pod's own
+	// bound port rather than assumed from the runtime spec.
+	workerPodWithWebPort := func(ordinal int, hostIP string, webPort int32) *corev1.Pod {
+		pod := workerPod(ordinal, hostIP)
+		pod.Spec.Containers = []corev1.Container{
+			{
+				Name: alluxioWorkerContainerName,
+				Ports: []corev1.ContainerPort{
+					{Name: "web", ContainerPort: webPort},
+				},
+			},
+		}
+		return pod
+	}
+
 	terminatingWorkerPod := func(ordinal int, hostIP string) *corev1.Pod {
 		pod := workerPod(ordinal, hostIP)
 		now := metav1.Now()
@@ -151,6 +168,35 @@ var _ = Describe("AlluxioEngine drainScalingDownWorkers", Label("pkg.ddc.alluxio
 			_, _, err := engine.drainScalingDownWorkers(context.TODO(), rt, 1, 2)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(capturedAddrs).To(Equal([]string{"[2001:db8::1]:" + fmt.Sprint(defaultWorkerWebPort)}))
+		})
+	})
+
+	Context("when the pod's actual web port differs from the spec/default value", func() {
+		It("targets the port the alluxio-worker container actually binds, not the spec/default port", func() {
+			// Regression test: in host network mode (the default), a worker
+			// web port that isn't pinned via spec.worker.ports.web is
+			// allocated dynamically by the operator's port allocator and
+			// only ever written into the worker container's own spec, never
+			// back into runtime.Spec.Worker.Ports. Targeting
+			// getWorkerWebPort's spec/default value instead of the pod's
+			// actual bound port would silently address the wrong worker.
+			engine = newEngineWithPods(workerPodWithWebPort(1, "10.0.0.1", 20493))
+			var capturedAddrs []string
+			patch1 := gomonkey.ApplyFunc(operations.AlluxioFileUtils.DecommissionWorkers,
+				func(_ operations.AlluxioFileUtils, addrs []string) error {
+					capturedAddrs = append([]string(nil), addrs...)
+					return nil
+				})
+			defer patch1.Reset()
+			patch2 := gomonkey.ApplyFunc(operations.AlluxioFileUtils.CountActiveWorkers,
+				func(_ operations.AlluxioFileUtils) (int, error) { return 1, nil })
+			defer patch2.Reset()
+
+			drained, addrs, err := engine.drainScalingDownWorkers(context.TODO(), rt, 1, 2)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(drained).To(BeTrue())
+			Expect(addrs).To(Equal([]string{"10.0.0.1:20493"}))
+			Expect(capturedAddrs).To(Equal([]string{"10.0.0.1:20493"}))
 		})
 	})
 
@@ -390,6 +436,48 @@ var _ = Describe("AlluxioEngine getWorkerWebPort", Label("pkg.ddc.alluxio.replic
 			},
 		}
 		Expect(engine.getWorkerWebPort(rt)).To(Equal(defaultWorkerWebPort))
+	})
+})
+
+var _ = Describe("workerWebPortFromPod", Label("pkg.ddc.alluxio.replicas_drain_test.go"), func() {
+	It("returns the port bound by the alluxio-worker container's \"web\" port", func() {
+		pod := &corev1.Pod{
+			Spec: corev1.PodSpec{
+				Containers: []corev1.Container{
+					{Name: "alluxio-worker", Ports: []corev1.ContainerPort{{Name: "web", ContainerPort: 20493}}},
+				},
+			},
+		}
+		port, ok := workerWebPortFromPod(pod)
+		Expect(ok).To(BeTrue())
+		Expect(port).To(Equal(20493))
+	})
+
+	It("ignores the alluxio-job-worker container's own \"web\" port", func() {
+		// alluxio-job-worker also exposes a differently-numbered port named
+		// "web" (see charts/alluxio/templates/worker/statefulset.yaml) - it
+		// must not be mistaken for the alluxio-worker container's web port.
+		pod := &corev1.Pod{
+			Spec: corev1.PodSpec{
+				Containers: []corev1.Container{
+					{Name: "alluxio-job-worker", Ports: []corev1.ContainerPort{{Name: "web", ContainerPort: 30003}}},
+				},
+			},
+		}
+		_, ok := workerWebPortFromPod(pod)
+		Expect(ok).To(BeFalse())
+	})
+
+	It("returns false when the alluxio-worker container has no \"web\" port", func() {
+		pod := &corev1.Pod{
+			Spec: corev1.PodSpec{
+				Containers: []corev1.Container{
+					{Name: "alluxio-worker"},
+				},
+			},
+		}
+		_, ok := workerWebPortFromPod(pod)
+		Expect(ok).To(BeFalse())
 	})
 })
 
